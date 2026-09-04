@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Camera Cinema Aperture / Film Slate body -->
+    <path
+        android:pathData="M32,36 L76,36 A6,6 0 0 1 82,42 L82,68 A6,6 0 0 1 76,74 L32,74 A6,6 0 0 1 26,68 L26,42 A6,6 0 0 1 32,36 Z"
+        android:fillColor="#1E1B4B"
+        android:strokeWidth="2.5"
+        android:strokeColor="#A855F7" />
+
+    <!-- Lens Rim & Film Spool -->
+    <path
+        android:pathData="M54,55m-14,0a14,14 0 1,1 28,0a14,14 0 1,1 -28,0">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="40"
+                android:startY="41"
+                android:endX="68"
+                android:endY="69"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#38BDF8" />
+                <item android:offset="1.0" android:color="#6366F1" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Play triangle inside lens -->
+    <path
+        android:pathData="M50,47 L62,55 L50,63 Z"
+        android:fillColor="#FFFFFF" />
+
+    <!-- AI Sparkle Star 1 top right -->
+    <path
+        android:pathData="M78,32 C78,35 81,35 81,35 C81,35 78,35 78,38 C78,35 75,35 75,35 C75,35 78,35 78,32 Z"
+        android:fillColor="#FBBF24" />
+
+    <!-- AI Sparkle Star 2 bottom left -->
+    <path
+        android:pathData="M29,71 C29,73 31,73 31,73 C31,73 29,73 29,75 C29,73 27,73 27,73 C27,73 29,73 29,71 Z"
+        android:fillColor="#38BDF8" />
+</vector>

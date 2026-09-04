@@ -1,0 +1,6 @@
+{
+  "name": "Kishu",
+  "description": "AI Video & Image Creation Studio with multi-scene generation up to 30 min, voiceover TTS in any language, customizable subtitles (SRT), and clip editor.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
