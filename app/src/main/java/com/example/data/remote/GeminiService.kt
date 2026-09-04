@@ -3,500 +3,270 @@ package com.example.data.remote
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.util.Base64
-import android.util.Log
+import android.net.Uri
 import com.example.BuildConfig
 import com.example.data.model.AspectRatio
-import com.example.data.model.CameraMotion
-import com.example.data.model.SceneEntity
-import com.example.data.model.TransitionType
-import com.example.data.model.VideoStyle
-import com.example.data.model.VoiceLanguage
-import com.example.subtitles.SrtManager
+import com.example.data.model.Clip
+import com.example.data.model.Project
+import com.example.data.model.StylePreset
+import com.example.data.model.Subtitle
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.File
-import java.io.FileOutputStream
-import java.util.concurrent.TimeUnit
-import kotlin.math.max
-
-data class StoryboardResult(
-    val title: String,
-    val scenes: List<SceneEntity>,
-    val srtContent: String,
-    val overview: String
-)
-
-data class GeneratedImageResult(
-    val bitmap: Bitmap?,
-    val localFilePath: String?,
-    val enhancedPrompt: String,
-    val description: String
-)
+import java.io.BufferedReader
+import java.io.InputStreamReader
+import java.io.OutputStreamWriter
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
+import java.util.UUID
 
 class GeminiService(private val context: Context) {
 
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(60, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .writeTimeout(60, TimeUnit.SECONDS)
-        .build()
-
     private val apiKey: String
-        get() = try {
-            BuildConfig.GEMINI_API_KEY
-        } catch (e: Throwable) {
-            ""
-        }
-
-    fun hasApiKey(): Boolean = apiKey.isNotBlank() && apiKey != "MY_GEMINI_API_KEY"
-
-    /**
-     * AI Prompt Expander - Takes any brief idea and turns it into an award-winning cinematic prompt
-     */
-    suspend fun expandPrompt(
-        rawPrompt: String,
-        style: VideoStyle,
-        isImage: Boolean = false
-    ): String = withContext(Dispatchers.IO) {
-        if (!hasApiKey()) {
-            return@withContext "${rawPrompt.trim()}, ${style.promptModifier}, volumetric lighting, ultra-detailed textures, master composition"
-        }
-
-        try {
-            val systemInstruction = "You are a world-class AI prompt engineer for cinematic video and high-end graphic generation. Expand the user's prompt into an ultra-descriptive, highly visual prompt with precise details on lighting, camera angles, textures, colors, and atmosphere for ${style.displayName}."
-            val userMessage = "Expand this prompt for ${if (isImage) "realistic high-quality image generation" else "cinematic video generation"}: \"$rawPrompt\". Style: ${style.displayName}. Keep it purely the enhanced prompt text, without any conversational filler."
-
-            val response = callGeminiText(systemInstruction, userMessage)
-            if (response.isNotBlank()) response.trim() else "${rawPrompt.trim()}, ${style.promptModifier}"
-        } catch (e: Exception) {
-            Log.w("GeminiService", "Prompt expansion fallback used: ${e.message}")
-            "${rawPrompt.trim()}, ${style.promptModifier}"
-        }
-    }
-
-    /**
-     * Generates a complete multi-scene storyboard for video up to 30 minutes.
-     * Generates sequential scenes with camera directions, visual descriptions,
-     * native language narration, and SRT subtitles.
-     */
-    suspend fun generateStoryboard(
-        userPrompt: String,
-        durationSeconds: Int,
-        style: VideoStyle,
-        aspectRatio: AspectRatio,
-        language: VoiceLanguage,
-        voiceTone: String
-    ): StoryboardResult = withContext(Dispatchers.IO) {
-        // Determine number of scenes based on duration
-        // Short: 15s -> 3 scenes (5s each)
-        // 60s -> 6 scenes (10s each)
-        // 5 min -> 10 scenes (30s each)
-        // 10 min -> 12 scenes (50s each)
-        // 30 min (1800s) -> 15-20 rich scenes/chapters (e.g. 90-120s each)
-        val targetSceneCount = when {
-            durationSeconds <= 20 -> 3
-            durationSeconds <= 60 -> 4
-            durationSeconds <= 180 -> 6
-            durationSeconds <= 600 -> 8
-            durationSeconds <= 1200 -> 12
-            else -> 15 // Up to 30 minutes full length
-        }
-        val secondsPerScene = max(3, durationSeconds / targetSceneCount)
-
-        if (!hasApiKey()) {
-            return@withContext generateFallbackStoryboard(userPrompt, durationSeconds, style, language, targetSceneCount, secondsPerScene)
-        }
-
-        val systemPrompt = """
-            You are Kishu AI, an expert cinematic director, screenplay writer, and video producer.
-            The user wants to produce a video of duration $durationSeconds seconds ($style style).
-            Target scenes: $targetSceneCount scenes (each approx $secondsPerScene seconds).
-            Selected voiceover & subtitle language: ${language.label} (${language.nativeName}).
-            
-            Produce a JSON response with:
-            {
-              "title": "A short compelling title",
-              "overview": "Brief description of the story arc",
-              "scenes": [
-                {
-                  "sceneIndex": 1,
-                  "title": "Scene name",
-                  "visualPrompt": "Detailed visual description of this shot for 3D/cinematic rendering",
-                  "narrationText": "Voiceover spoken text in ${language.label} (${language.nativeName})",
-                  "subtitleText": "Subtitle line in ${language.label} (${language.nativeName})",
-                  "durationSeconds": $secondsPerScene,
-                  "cameraMotion": "ZOOM_IN" | "ZOOM_OUT" | "PAN_LEFT" | "PAN_RIGHT" | "STATIC",
-                  "transitionType": "CROSSFADE" | "SLIDE_LEFT" | "ZOOM_TRANSITION" | "CUT"
-                }
-              ]
-            }
-            Return ONLY valid JSON.
-        """.trimIndent()
-
-        val userMessage = """
-            Create the full multi-scene screenplay and visual storyboard for:
-            Prompt: $userPrompt
-            Aspect Ratio: ${aspectRatio.label}
-            Voice Tone: $voiceTone
-            Total Duration: $durationSeconds seconds
-        """.trimIndent()
-
-        try {
-            val jsonText = callGeminiText(systemPrompt, userMessage)
-            if (jsonText.isBlank()) {
-                return@withContext generateFallbackStoryboard(userPrompt, durationSeconds, style, language, targetSceneCount, secondsPerScene)
-            }
-            val cleanJson = extractJson(jsonText)
-            val root = JSONObject(cleanJson)
-            val title = root.optString("title", "Kishu Creation")
-            val overview = root.optString("overview", "AI Video Project")
-            val scenesArray = root.optJSONArray("scenes")
-                ?: return@withContext generateFallbackStoryboard(userPrompt, durationSeconds, style, language, targetSceneCount, secondsPerScene)
-
-            val scenes = mutableListOf<SceneEntity>()
-            val cameraMotions = listOf(CameraMotion.ZOOM_IN, CameraMotion.PAN_LEFT, CameraMotion.ZOOM_OUT, CameraMotion.PAN_RIGHT)
-
-            for (i in 0 until scenesArray.length()) {
-                val obj = scenesArray.getJSONObject(i)
-                val sceneIndex = obj.optInt("sceneIndex", i + 1)
-                val sceneTitle = obj.optString("title", "Scene $sceneIndex")
-                val visualPrompt = obj.optString("visualPrompt", "$userPrompt - Scene $sceneIndex")
-                val narrationText = obj.optString("narrationText", "")
-                val subtitleText = obj.optString("subtitleText", narrationText)
-                val sceneDuration = obj.optInt("durationSeconds", secondsPerScene)
-                val camString = obj.optString("cameraMotion", cameraMotions[i % cameraMotions.size].name)
-                val transString = obj.optString("transitionType", TransitionType.CROSSFADE.name)
-
-                scenes.add(
-                    SceneEntity(
-                        projectId = 0,
-                        sceneIndex = sceneIndex,
-                        title = sceneTitle,
-                        visualPrompt = visualPrompt,
-                        narrationText = narrationText,
-                        subtitleText = subtitleText,
-                        durationSeconds = sceneDuration,
-                        cameraMotion = camString,
-                        transitionType = transString,
-                        accentColorHex = getPaletteColor(i)
-                    )
-                )
-            }
-
-            val srt = SrtManager.generateSrtFromScenes(scenes)
-            StoryboardResult(title, scenes, srt, overview)
-        } catch (e: Exception) {
-            Log.w("GeminiService", "Notice: using offline cinematic storyboard generator (${e.message})")
-            generateFallbackStoryboard(userPrompt, durationSeconds, style, language, targetSceneCount, secondsPerScene)
-        }
-    }
-
-    /**
-     * Text to Image Generation using gemini-2.5-flash-image
-     */
-    suspend fun generateImage(
-        prompt: String,
-        style: VideoStyle,
-        aspectRatio: AspectRatio
-    ): GeneratedImageResult = withContext(Dispatchers.IO) {
-        val enhanced = expandPrompt(prompt, style, isImage = true)
-
-        if (!hasApiKey()) {
-            return@withContext generateLocalGraphicAsset(enhanced, style, aspectRatio)
-        }
-
-        try {
-            val endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=$apiKey"
-            val ratioStr = when (aspectRatio) {
-                AspectRatio.LANDSCAPE_16_9 -> "16:9"
-                AspectRatio.PORTRAIT_9_16 -> "9:16"
-                AspectRatio.CLASSIC_4_3 -> "4:3"
-                AspectRatio.CINEMA_21_9 -> "16:9"
-                AspectRatio.SQUARE_1_1 -> "1:1"
-            }
-
-            val payload = JSONObject().apply {
-                put("contents", JSONArray().apply {
-                    put(JSONObject().apply {
-                        put("parts", JSONArray().apply {
-                            put(JSONObject().apply { put("text", enhanced) })
-                        })
-                    })
-                })
-                put("generationConfig", JSONObject().apply {
-                    put("responseModalities", JSONArray().apply {
-                        put("TEXT")
-                        put("IMAGE")
-                    })
-                    put("imageConfig", JSONObject().apply {
-                        put("aspectRatio", ratioStr)
-                    })
-                })
-            }
-
-            val request = Request.Builder()
-                .url(endpoint)
-                .post(payload.toString().toRequestBody("application/json".toMediaType()))
-                .build()
-
-            val response = client.newCall(request).execute()
-            val respBody = response.body?.string() ?: ""
-
-            if (!response.isSuccessful) {
-                Log.e("GeminiService", "Image generation API error: $respBody")
-                return@withContext generateLocalGraphicAsset(enhanced, style, aspectRatio)
-            }
-
-            val json = JSONObject(respBody)
-            val candidates = json.optJSONArray("candidates")
-            val candidate = candidates?.optJSONObject(0)
-            val content = candidate?.optJSONObject("content")
-            val parts = content?.optJSONArray("parts")
-
-            var imageBitmap: Bitmap? = null
-            var textDescription = ""
-
-            if (parts != null) {
-                for (i in 0 until parts.length()) {
-                    val part = parts.getJSONObject(i)
-                    if (part.has("inlineData")) {
-                        val inlineData = part.getJSONObject("inlineData")
-                        val b64Data = inlineData.getString("data")
-                        val bytes = Base64.decode(b64Data, Base64.DEFAULT)
-                        imageBitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                    } else if (part.has("text")) {
-                        textDescription = part.getString("text")
-                    }
-                }
-            }
-
-            if (imageBitmap != null) {
-                val file = saveBitmapToDisk(imageBitmap, "kishu_img_${System.currentTimeMillis()}.png")
-                GeneratedImageResult(imageBitmap, file.absolutePath, enhanced, textDescription.ifBlank { "Generated with Kishu AI" })
-            } else {
-                generateLocalGraphicAsset(enhanced, style, aspectRatio)
-            }
-        } catch (e: Exception) {
-            Log.w("GeminiService", "Image generation notice: using local graphic renderer (${e.message})")
-            generateLocalGraphicAsset(enhanced, style, aspectRatio)
-        }
-    }
-
-    private suspend fun callGeminiText(systemInstruction: String, userMessage: String): String {
-        val models = listOf("gemini-3.5-flash", "gemini-3.1-flash-lite-preview", "gemini-flash-latest")
-        for (model in models) {
+        get() = BuildConfig.MY_GEMINI_API_KEY.ifEmpty {
             try {
-                val endpoint = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey"
+                val clazz = Class.forName("com.example.BuildConfig")
+                val field = clazz.getField("MY_GEMINI_API_KEY")
+                field.get(null) as? String ?: ""
+            } catch (e: Exception) {
+                ""
+            }
+        }
 
-                val payload = JSONObject().apply {
+    suspend fun generateStory(
+        prompt: String,
+        style: StylePreset = StylePreset.CINEMATIC,
+        ratio: AspectRatio = AspectRatio.RATIO_9_16,
+        sceneCount: Int = 4
+    ): Result<Project> = withContext(Dispatchers.IO) {
+        try {
+            val validKey = apiKey.trim()
+            if (validKey.isNotEmpty() && !validKey.startsWith("MY_")) {
+                val endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=$validKey"
+                val systemPrompt = """
+                    You are Kishu AI, an expert video director. Generate a structured video project from the user's prompt.
+                    Return ONLY a JSON object matching this schema:
+                    {
+                      "title": "Short title",
+                      "description": "Short description",
+                      "clips": [
+                        {
+                          "order": 0,
+                          "title": "Scene title",
+                          "prompt": "Detailed visual description of this scene",
+                          "durationSeconds": 5.0,
+                          "cameraMotion": "PAN_LEFT",
+                          "voiceoverText": "Narrator voiceover script in Hindi/English",
+                          "subtitles": [
+                            {"text": "Subtitle chunk 1", "startTimeMs": 0, "endTimeMs": 2500},
+                            {"text": "Subtitle chunk 2", "startTimeMs": 2500, "endTimeMs": 5000}
+                          ]
+                        }
+                      ]
+                    }
+                    Generate exactly $sceneCount clips. Do not include markdown code fences, return pure JSON.
+                """.trimIndent()
+
+                val requestBody = JSONObject().apply {
                     put("contents", JSONArray().apply {
                         put(JSONObject().apply {
+                            put("role", "user")
                             put("parts", JSONArray().apply {
-                                put(JSONObject().apply { put("text", userMessage) })
+                                put(JSONObject().put("text", "$systemPrompt\n\nUser prompt: $prompt\nStyle: ${style.displayName}"))
                             })
                         })
                     })
-                    if (systemInstruction.isNotBlank()) {
-                        put("systemInstruction", JSONObject().apply {
-                            put("parts", JSONArray().apply {
-                                put(JSONObject().apply { put("text", systemInstruction) })
-                            })
-                        })
-                    }
-                    put("generationConfig", JSONObject().apply {
-                        put("temperature", 0.7)
-                        put("topP", 0.95)
-                    })
                 }
 
-                val request = Request.Builder()
-                    .url(endpoint)
-                    .post(payload.toString().toRequestBody("application/json".toMediaType()))
-                    .build()
+                val responseStr = makeHttpRequest(endpoint, requestBody.toString())
+                val root = JSONObject(responseStr)
+                val candidates = root.optJSONArray("candidates")
+                val firstCandidate = candidates?.optJSONObject(0)
+                val contentObj = firstCandidate?.optJSONObject("content")
+                val parts = contentObj?.optJSONArray("parts")
+                val textOutput = parts?.optJSONObject(0)?.optString("text") ?: ""
 
-                val response = client.newCall(request).execute()
-                val body = response.body?.string() ?: ""
+                val cleanJson = textOutput.trim()
+                    .removePrefix("```json")
+                    .removePrefix("```")
+                    .removeSuffix("```")
+                    .trim()
 
-                if (response.isSuccessful) {
-                    val root = JSONObject(body)
-                    val candidates = root.optJSONArray("candidates")
-                    val candidate = candidates?.optJSONObject(0)
-                    val content = candidate?.optJSONObject("content")
-                    val parts = content?.optJSONArray("parts")
-                    val text = parts?.optJSONObject(0)?.optString("text")
-                    if (!text.isNullOrBlank()) {
-                        return text
+                val projectJson = JSONObject(cleanJson)
+                val title = projectJson.optString("title", prompt.take(30))
+                val description = projectJson.optString("description", prompt)
+                val clipsJson = projectJson.optJSONArray("clips") ?: JSONArray()
+
+                val clips = mutableListOf<Clip>()
+                for (i in 0 until clipsJson.length()) {
+                    val cObj = clipsJson.getJSONObject(i)
+                    val clipPrompt = cObj.optString("prompt", "$prompt scene $i")
+                    val duration = cObj.optDouble("durationSeconds", 4.0).toFloat()
+                    val voiceover = cObj.optString("voiceoverText", "")
+
+                    val subsJson = cObj.optJSONArray("subtitles")
+                    val subs = mutableListOf<Subtitle>()
+                    if (subsJson != null) {
+                        for (j in 0 until subsJson.length()) {
+                            val sObj = subsJson.getJSONObject(j)
+                            subs.add(
+                                Subtitle(
+                                    text = sObj.optString("text", ""),
+                                    startTimeMs = sObj.optLong("startTimeMs", 0L),
+                                    endTimeMs = sObj.optLong("endTimeMs", 2000L)
+                                )
+                            )
+                        }
                     }
-                } else if (response.code == 429) {
-                    Log.w("GeminiService", "Model $model quota reached (HTTP 429). Switching to fallback model...")
-                    continue
-                } else {
-                    Log.w("GeminiService", "Model $model returned HTTP ${response.code}. Switching to fallback...")
-                    continue
+
+                    val encodedPrompt = URLEncoder.encode("$clipPrompt, ${style.promptModifier}, 4k ultra detailed, masterpiece", "UTF-8")
+                    val width = if (ratio == AspectRatio.RATIO_9_16) 720 else 1280
+                    val height = if (ratio == AspectRatio.RATIO_9_16) 1280 else 720
+                    val imageUrl = "https://image.pollinations.ai/prompt/$encodedPrompt?width=$width&height=$height&nologo=true&seed=${UUID.randomUUID().hashCode()}"
+
+                    clips.add(
+                        Clip(
+                            id = UUID.randomUUID().toString(),
+                            order = i,
+                            title = cObj.optString("title", "Scene ${i + 1}"),
+                            prompt = clipPrompt,
+                            imageUrl = imageUrl,
+                            durationSeconds = duration,
+                            cameraMotion = cObj.optString("cameraMotion", "ZOOM_IN"),
+                            voiceoverText = voiceover,
+                            subtitles = subs
+                        )
+                    )
                 }
-            } catch (e: Exception) {
-                Log.w("GeminiService", "Model $model request attempt notice: ${e.message}")
+
+                Result.success(
+                    Project(
+                        id = UUID.randomUUID().toString(),
+                        title = title,
+                        description = description,
+                        aspectRatio = ratio,
+                        stylePreset = style,
+                        clips = clips
+                    )
+                )
+            } else {
+                // Autonomous engine without API Key requirement
+                Result.success(generateLocalProject(prompt, style, ratio, sceneCount))
             }
-        }
-        return ""
-    }
-
-    private fun extractJson(raw: String): String {
-        val trimmed = raw.trim()
-        val startIndex = trimmed.indexOf('{')
-        val endIndex = trimmed.lastIndexOf('}')
-        return if (startIndex != -1 && endIndex != -1 && endIndex > startIndex) {
-            trimmed.substring(startIndex, endIndex + 1)
-        } else {
-            trimmed
+        } catch (e: Exception) {
+            Result.success(generateLocalProject(prompt, style, ratio, sceneCount))
         }
     }
 
-    private fun generateFallbackStoryboard(
+    suspend fun generateImage(
         prompt: String,
-        durationSeconds: Int,
-        style: VideoStyle,
-        language: VoiceLanguage,
-        targetSceneCount: Int,
-        secondsPerScene: Int
-    ): StoryboardResult {
-        val scenes = mutableListOf<SceneEntity>()
-        val cleanPrompt = prompt.ifBlank { "Cinematic AI Odyssey" }
+        style: StylePreset = StylePreset.CINEMATIC,
+        ratio: AspectRatio = AspectRatio.RATIO_9_16
+    ): Result<String> = withContext(Dispatchers.IO) {
+        try {
+            val encodedPrompt = URLEncoder.encode("$prompt, ${style.promptModifier}, highly detailed, cinematic lighting, photorealistic, 8k resolution", "UTF-8")
+            val width = if (ratio == AspectRatio.RATIO_9_16) 720 else 1280
+            val height = if (ratio == AspectRatio.RATIO_9_16) 1280 else 720
+            val seed = (System.currentTimeMillis() % 1000000).toInt()
+            val imageUrl = "https://image.pollinations.ai/prompt/$encodedPrompt?width=$width&height=$height&nologo=true&seed=$seed"
+            Result.success(imageUrl)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
 
-        val sceneArchetypes = listOf(
-            Triple("Opening Establishing Shot", "The journey begins as a breathtaking vista unfolds under golden hour light.", "यह यात्रा एक भव्य दृश्य और सुनहरी रोशनी के साथ शुरू होती है।"),
-            Triple("Dynamic Action Sequence", "Camera glides forward capturing intricate movements and rich cinematic details.", "कैमरा आगे बढ़ता है और हर बारीक हरकत को जीवंत बना देता है।"),
-            Triple("Emotional Climax", "Dramatic shift in lighting and intensity reveals the central story element.", "प्रकाश और भावों का यह नाटकीय मोड़ कहानी के मुख्य रहस्य को उजागर करता है।"),
-            Triple("Epic Resolution", "A wide cinematic pull-back shot leaving an unforgettable artistic impression.", "एक भव्य सिनेमैटिक शॉट के साथ यह दृश्य एक अमिट छाप छोड़ जाता है।")
+    private fun generateLocalProject(
+        prompt: String,
+        style: StylePreset,
+        ratio: AspectRatio,
+        sceneCount: Int
+    ): Project {
+        val width = if (ratio == AspectRatio.RATIO_9_16) 720 else 1280
+        val height = if (ratio == AspectRatio.RATIO_9_16) 1280 else 720
+        val motions = listOf("ZOOM_IN", "PAN_RIGHT", "ZOOM_OUT", "PAN_LEFT")
+
+        val scenes = listOf(
+            Triple(
+                "आरंभ (The Beginning)",
+                "Dramatic cinematic opening scene establishing $prompt, golden hour lighting, cinematic shot",
+                "प्रस्तुत है एक अद्भुत दृश्य: $prompt की भव्य शुरुआत।"
+            ),
+            Triple(
+                "विस्तार (The Journey)",
+                "Close-up detailed view highlighting the beauty and emotion of $prompt, cinematic realism",
+                "इस दिव्य और मनोरम यात्रा के अद्भुत रंग और गहराई।"
+            ),
+            Triple(
+                "चरम (The Climax)",
+                "Dynamic energetic motion scene with radiant magical glow portraying $prompt, masterpiece",
+                "तेज और ऊर्जावान दृश्य, जो दिल को छू जाए।"
+            ),
+            Triple(
+                "समापन (The Finale)",
+                "Peaceful serene wide angle concluding view of $prompt, high resolution, atmospheric mood",
+                "और इस प्रकार यह सुंदर गाथा शांति और आनंद के साथ संपन्न होती है।"
+            )
         )
 
-        for (i in 0 until targetSceneCount) {
-            val archetype = sceneArchetypes[i % sceneArchetypes.size]
-            val sceneIndex = i + 1
-            val motion = when (i % 4) {
-                0 -> CameraMotion.ZOOM_IN.name
-                1 -> CameraMotion.PAN_LEFT.name
-                2 -> CameraMotion.ZOOM_OUT.name
-                else -> CameraMotion.PAN_RIGHT.name
-            }
+        val clips = (0 until sceneCount).map { i ->
+            val scene = scenes[i % scenes.size]
+            val encoded = URLEncoder.encode("${scene.second}, ${style.promptModifier}, masterpiece, highly detailed", "UTF-8")
+            val seed = (System.currentTimeMillis() + (i * 997)).hashCode()
+            val imageUrl = "https://image.pollinations.ai/prompt/$encoded?width=$width&height=$height&nologo=true&seed=$seed"
 
-            val narration = if (language == VoiceLanguage.HINDI) {
-                "${archetype.third} $cleanPrompt के दृश्य $sceneIndex में आपका स्वागत है।"
-            } else {
-                "${archetype.second} Welcome to scene $sceneIndex of $cleanPrompt."
-            }
-
-            val subtitle = narration
-
-            scenes.add(
-                SceneEntity(
-                    projectId = 0,
-                    sceneIndex = sceneIndex,
-                    title = "Scene $sceneIndex: ${archetype.first}",
-                    visualPrompt = "$cleanPrompt, Scene $sceneIndex - ${archetype.first}, ${style.promptModifier}",
-                    narrationText = narration,
-                    subtitleText = subtitle,
-                    durationSeconds = secondsPerScene,
-                    cameraMotion = motion,
-                    transitionType = TransitionType.CROSSFADE.name,
-                    accentColorHex = getPaletteColor(i)
+            Clip(
+                id = UUID.randomUUID().toString(),
+                order = i,
+                title = scene.first,
+                prompt = scene.second,
+                imageUrl = imageUrl,
+                durationSeconds = 4.5f,
+                cameraMotion = motions[i % motions.size],
+                voiceoverText = scene.third,
+                subtitles = listOf(
+                    Subtitle(text = scene.third.take(scene.third.length / 2), startTimeMs = 0L, endTimeMs = 2200L),
+                    Subtitle(text = scene.third.substring(scene.third.length / 2), startTimeMs = 2200L, endTimeMs = 4500L)
                 )
             )
         }
 
-        val srt = SrtManager.generateSrtFromScenes(scenes)
-        return StoryboardResult(
-            title = cleanPrompt.take(40).capitalizeWords(),
-            scenes = scenes,
-            srtContent = srt,
-            overview = "Cinematic $style production created with Kishu AI Studio."
+        return Project(
+            id = UUID.randomUUID().toString(),
+            title = prompt.take(30).ifEmpty { "Kishu Creation" },
+            description = "Cinematic video generation of $prompt",
+            aspectRatio = ratio,
+            stylePreset = style,
+            clips = clips
         )
     }
 
-    private fun generateLocalGraphicAsset(
-        prompt: String,
-        style: VideoStyle,
-        aspectRatio: AspectRatio
-    ): GeneratedImageResult {
-        val width = 800
-        val height = (width / aspectRatio.ratioFloat).toInt().coerceAtLeast(300)
+    private fun makeHttpRequest(urlStr: String, jsonBody: String): String {
+        val url = URL(urlStr)
+        val conn = url.openConnection() as HttpURLConnection
+        conn.requestMethod = "POST"
+        conn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+        conn.setRequestProperty("Accept", "application/json")
+        conn.doOutput = true
+        conn.connectTimeout = 30000
+        conn.readTimeout = 30000
 
-        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        val canvas = android.graphics.Canvas(bitmap)
-
-        // Gradient background matching style
-        val colors = when (style) {
-            VideoStyle.CYBERPUNK -> intArrayOf(android.graphics.Color.parseColor("#0F172A"), android.graphics.Color.parseColor("#7C3AED"), android.graphics.Color.parseColor("#06B6D4"))
-            VideoStyle.CARTOON_3D -> intArrayOf(android.graphics.Color.parseColor("#F97316"), android.graphics.Color.parseColor("#FBBF24"), android.graphics.Color.parseColor("#38BDF8"))
-            VideoStyle.ANIME_2D -> intArrayOf(android.graphics.Color.parseColor("#312E81"), android.graphics.Color.parseColor("#818CF8"), android.graphics.Color.parseColor("#F472B6"))
-            VideoStyle.FANTASY_MYTH -> intArrayOf(android.graphics.Color.parseColor("#1E1B4B"), android.graphics.Color.parseColor("#B45309"), android.graphics.Color.parseColor("#FCD34D"))
-            else -> intArrayOf(android.graphics.Color.parseColor("#0B0F19"), android.graphics.Color.parseColor("#4C1D95"), android.graphics.Color.parseColor("#1E1B4B"))
+        OutputStreamWriter(conn.outputStream, "UTF-8").use { writer ->
+            writer.write(jsonBody)
+            writer.flush()
         }
 
-        val gradient = android.graphics.LinearGradient(
-            0f, 0f, width.toFloat(), height.toFloat(),
-            colors, null, android.graphics.Shader.TileMode.CLAMP
-        )
-        val paint = android.graphics.Paint().apply {
-            shader = gradient
-            isAntiAlias = true
-        }
-        canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), paint)
-
-        // Decorative circles/aperture
-        val glowPaint = android.graphics.Paint().apply {
-            color = android.graphics.Color.parseColor("#33FFFFFF")
-            this.style = android.graphics.Paint.Style.STROKE
-            strokeWidth = 3f
-            isAntiAlias = true
-        }
-        canvas.drawCircle(width / 2f, height / 2f, (height / 3f), glowPaint)
-        canvas.drawCircle(width / 2f, height / 2f, (height / 4f), glowPaint)
-
-        // Title text
-        val textPaint = android.graphics.Paint().apply {
-            color = android.graphics.Color.WHITE
-            textSize = 36f
-            textAlign = android.graphics.Paint.Align.CENTER
-            isAntiAlias = true
-            isFakeBoldText = true
-        }
-        val subPaint = android.graphics.Paint().apply {
-            color = android.graphics.Color.parseColor("#E2E8F0")
-            textSize = 24f
-            textAlign = android.graphics.Paint.Align.CENTER
-            isAntiAlias = true
+        val code = conn.responseCode
+        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+        val response = BufferedReader(InputStreamReader(stream, "UTF-8")).use { reader ->
+            reader.readText()
         }
 
-        val displayPrompt = if (prompt.length > 50) prompt.take(47) + "..." else prompt
-        canvas.drawText("✨ Kishu AI Studio", width / 2f, height / 2f - 20, textPaint)
-        canvas.drawText(displayPrompt, width / 2f, height / 2f + 30, subPaint)
+        if (code !in 200..299) {
+            throw Exception("HTTP $code: $response")
+        }
 
-        val file = saveBitmapToDisk(bitmap, "kishu_art_${System.currentTimeMillis()}.png")
-        return GeneratedImageResult(bitmap, file.absolutePath, prompt, "High-fidelity ${style.displayName} visual")
+        return response
     }
-
-    private fun saveBitmapToDisk(bitmap: Bitmap, filename: String): File {
-        val dir = File(context.filesDir, "kishu_media")
-        if (!dir.exists()) dir.mkdirs()
-        val file = File(dir, filename)
-        FileOutputStream(file).use { out ->
-            bitmap.compress(Bitmap.CompressFormat.PNG, 95, out)
-        }
-        return file
-    }
-
-    private fun getPaletteColor(index: Int): String {
-        val colors = listOf("#6366F1", "#8B5CF6", "#EC4899", "#06B6D4", "#F59E0B", "#10B981")
-        return colors[index % colors.size]
-    }
-
-    private fun String.capitalizeWords(): String = split(" ").joinToString(" ") { it.replaceFirstChar { char -> char.uppercase() } }
 }
